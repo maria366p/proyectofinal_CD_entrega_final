@@ -1,5 +1,6 @@
 # el dashboard no carga el modelo: todo lo pide a la API para que haya un solo modelo
 import os
+import re
 from datetime import date, datetime
 
 import altair as alt
@@ -25,7 +26,9 @@ def cargar_cola():
         cola[c] = pd.to_datetime(cola[c])
     cola["dias"] = (cola["fecha_factura_nueva"] - cola["fecha_factura_anterior"]).dt.days
     cola["nivel"] = pd.cut(cola["puntaje"], [-0.01, 0.5, 0.8, 1.0], labels=["bajo", "medio", "alto"]).astype(str)
-    cola = cola.sort_values("puntaje", ascending=False).reset_index(drop=True)
+    # la regla del número va primero (ajuste por la revisión del Banco)
+    cola.loc[cola["regla_numero"] == 1, "nivel"] = "alto"
+    cola = cola.sort_values(["regla_numero", "puntaje"], ascending=False).reset_index(drop=True)
     cola.insert(0, "caso", [f"C-{i + 1:04d}" for i in range(len(cola))])
     return cola
 
@@ -49,10 +52,10 @@ def motivos(fila):
     # mismas variables del modelo, en palabras del analista
     m = []
     dias = (pd.to_datetime(fila["fecha_factura_nueva"]) - pd.to_datetime(fila["fecha_factura_anterior"])).days
-    a = str(fila["numero_factura_anterior"]).upper().replace("-", "").replace(" ", "").lstrip("0")
-    b = str(fila["numero_factura_nueva"]).upper().replace("-", "").replace(" ", "").lstrip("0")
-    if a == b:
-        m.append("El número de factura es el mismo si se quitan guiones y espacios")
+    a = re.sub(r"[^A-Z0-9]", "", str(fila["numero_factura_anterior"]).upper()).lstrip("0")
+    b = re.sub(r"[^A-Z0-9]", "", str(fila["numero_factura_nueva"]).upper()).lstrip("0")
+    if a and b and (a == b or (min(len(a), len(b)) >= 6 and (a.startswith(b) or b.startswith(a)))):
+        m.append("Mismo número de factura al quitar signos o con un sufijo: en la revisión del Banco, 7 de 8 pares así eran duplicados")
     if dias <= 7:
         m.append(f"Llegó {dias} días después de la anterior, por el mismo monto")
     elif min(abs(dias - p) for p in (30, 91, 365)) > 7:
@@ -66,7 +69,6 @@ def motivos(fila):
     return m or ["Ningún motivo fuerte por sí solo; el puntaje sale de la combinación de variables"]
 
 
-# encabezado y filtros 
 st.title("Monitor de pagos y proveedores duplicados")
 st.caption("Procurement S2PA · el repositorio público usa datos sintéticos (DEMO_xxx)")
 
@@ -101,12 +103,11 @@ vista = cola[filtro]
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Resumen", "Cola de casos", "Proveedores", "Evaluar un par", "Seguimiento del KPI"])
 
-#  resumen 
 with tab1:
-    alertas = cola[cola["puntaje"] >= 0.5]
+    alertas = cola[(cola["puntaje"] >= 0.5) | (cola["regla_numero"] == 1)]
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Pares puntuados", f"{len(cola):,}")
-    c2.metric("Alertas (puntaje ≥ 0,5)", f"{len(alertas):,}", f"{len(alertas) / len(cola):.1%} de la cola", delta_color="off")
+    c2.metric("Alertas (regla o puntaje ≥ 0,5)", f"{len(alertas):,}", f"{len(alertas) / len(cola):.1%} de la cola", delta_color="off")
     c3.metric("Monto en alertas (CAD)", f"{alertas['monto_cad'].sum():,.0f}")
     c4.metric("Casos revisados", f"{len(revisados):,}", f"de {len(alertas)} alertas", delta_color="off")
 
@@ -136,18 +137,19 @@ with tab1:
         tooltip=["proveedor_id", "alertas", alt.Tooltip("monto:Q", format=",.0f")])
     st.altair_chart(barras, width="stretch")
 
-# cola 
 with tab2:
     st.subheader(f"Cola priorizada · {len(vista):,} casos con los filtros")
+    st.caption("Primero van los pares con el mismo número de factura (regla confirmada en la revisión del Banco) y después los demás ordenados por el puntaje del modelo.")
     st.dataframe(
         vista[["caso", "proveedor_id", "fecha_factura_anterior", "fecha_factura_nueva", "dias", "monto_cad",
-               "moneda", "canal_nuevo", "puntaje", "nivel"]],
+               "moneda", "canal_nuevo", "regla_numero", "puntaje", "nivel"]],
         hide_index=True, width="stretch", height=330,
         column_config={
             "puntaje": st.column_config.ProgressColumn("Puntaje", min_value=0, max_value=1, format="%.2f"),
             "monto_cad": st.column_config.NumberColumn("Monto (CAD)", format="%,.0f"),
             "fecha_factura_anterior": st.column_config.DateColumn("Factura anterior"),
             "fecha_factura_nueva": st.column_config.DateColumn("Factura nueva"),
+            "regla_numero": st.column_config.CheckboxColumn("Mismo número"),
             "dias": "Días", "canal_nuevo": "Canal", "proveedor_id": "Proveedor", "caso": "Caso", "moneda": "Moneda", "nivel": "Nivel"})
     st.download_button("Descargar la cola filtrada (CSV)", vista.to_csv(index=False).encode("utf-8"),
                        "cola_filtrada.csv", "text/csv")
@@ -183,7 +185,6 @@ with tab2:
                                           "comentario": nota})
                 st.success("Decisión guardada.")
 
-#  proveedores
 with tab3:
     grupos = (proveedores.groupby("grupo")
               .agg(llaves=("proveedor_id", "size"), entidad=("entidad", "first"),
@@ -218,7 +219,6 @@ with tab3:
                  column_config={"gasto_aprobado": st.column_config.NumberColumn("Gasto aprobado (CAD)", format="%,.0f"),
                                 "similitud_min": st.column_config.NumberColumn("Similitud mínima", format="%.2f")})
 
-# evaluar un par
 with tab4:
     st.subheader("Calcular el puntaje de un par de facturas con la API")
     with st.form("par"):
@@ -244,8 +244,10 @@ with tab4:
         if r.status_code == 200:
             res = r.json()[0]
             c1, c2 = st.columns([1, 2])
-            c1.metric("Probabilidad de pago doble", f"{res['probabilidad_duplicado']:.1%}", f"nivel {res['nivel']}",
+            c1.metric("Probabilidad del modelo", f"{res['probabilidad_duplicado']:.1%}", f"nivel {res['nivel']}",
                       delta_color="off")
+            if res["regla_numero"]:
+                c1.warning("Cumple la regla del número: va a la cola como nivel alto.")
             c1.progress(res["probabilidad_duplicado"])
             c2.markdown("**Motivos**")
             for mot in motivos(par):
@@ -253,7 +255,6 @@ with tab4:
         else:
             st.error(f"La API no aceptó el par: {r.text}")
 
-# seguimiento
 with tab5:
     st.subheader("Precisión real de la cola (KPI)")
     if len(decisiones) == 0:
